@@ -1,0 +1,214 @@
+name: Trace Inversion (Summary-to-Trace)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/trace_inversion.yml"
+
+jobs:
+  summary_to_trace_distill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+    env:
+      PYTHONUNBUFFERED: "1"
+      HF_DATASETS_OFFLINE: "0"
+      TRANSFORMERS_NO_ADVISORY_WARNINGS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir \
+            "torch>=2.3" \
+            "transformers>=4.45" \
+            "datasets>=2.20" \
+            "accelerate>=0.34" \
+            "scikit-learn>=1.5" \
+            bitsandbytes
+          # distillkit is not consistently published on PyPI; fall back to the official GitHub source.
+          pip install --no-cache-dir distillkit || \
+          pip install --no-cache-dir "git+https://github.com/arcee-ai/DistillKit.git"
+
+      - name: Run summary-to-trace inversion smoke experiment (50 steps)
+        run: |
+          python - <<'PY'
+          import random
+          import re
+
+          import torch
+          from datasets import load_dataset
+          from transformers import (
+              AutoModelForCausalLM,
+              AutoTokenizer,
+              BitsAndBytesConfig,
+              TrainingArguments,
+              Trainer,
+          )
+
+          random.seed(42)
+          torch.manual_seed(42)
+
+          STUDENT_MODEL = "Qwen/Qwen2.5-0.5B"
+          DATASET_NAME = "mlabonne/FineTome-100k"
+          MAX_STEPS = 50
+          TRAIN_SAMPLES = 256
+          EVAL_SAMPLES = 64
+          MAX_LENGTH = 512
+
+          def normalize(text: str):
+              text = text.lower()
+              text = re.sub(r"\s+", " ", text)
+              return text.strip()
+
+          def token_overlap_f1(pred: str, ref: str) -> float:
+              p_tokens = normalize(pred).split()
+              r_tokens = normalize(ref).split()
+              if not p_tokens or not r_tokens:
+                  return 0.0
+              p_set = set(p_tokens)
+              r_set = set(r_tokens)
+              overlap = len(p_set & r_set)
+              if overlap == 0:
+                  return 0.0
+              precision = overlap / len(p_set)
+              recall = overlap / len(r_set)
+              return 2 * precision * recall / (precision + recall)
+
+          print("Loading tokenizer and 4-bit quantized student model...")
+          tokenizer = AutoTokenizer.from_pretrained(STUDENT_MODEL, use_fast=True)
+          if tokenizer.pad_token is None:
+              tokenizer.pad_token = tokenizer.eos_token
+
+          quant_config = BitsAndBytesConfig(
+              load_in_4bit=True,
+              bnb_4bit_quant_type="nf4",
+              bnb_4bit_use_double_quant=True,
+              bnb_4bit_compute_dtype=torch.float16,
+          )
+
+          # CPU-first map keeps memory pressure predictable on ubuntu-latest.
+          model = AutoModelForCausalLM.from_pretrained(
+              STUDENT_MODEL,
+              quantization_config=quant_config,
+              device_map="cpu",
+              low_cpu_mem_usage=True,
+          )
+
+          print(f"Loading subset of dataset: {DATASET_NAME}")
+          ds = load_dataset(DATASET_NAME, split="train")
+          ds = ds.shuffle(seed=42)
+
+          # Flexible field resolution to tolerate schema drift.
+          summary_key_candidates = ["summary", "input", "prompt", "question", "instruction"]
+          trace_key_candidates = ["trace", "reasoning", "output", "response", "completion", "answer"]
+
+          def pick_key(example, candidates):
+              for k in candidates:
+                  if k in example and isinstance(example[k], str) and example[k].strip():
+                      return k
+              return None
+
+          first = ds[0]
+          summary_key = pick_key(first, summary_key_candidates)
+          trace_key = pick_key(first, trace_key_candidates)
+          if summary_key is None or trace_key is None:
+              raise ValueError(
+                  "Could not infer summary/trace fields from dataset schema. "
+                  f"Columns: {list(first.keys())}"
+              )
+
+          print(f"Using columns summary={summary_key!r}, trace={trace_key!r}")
+
+          def build_example(ex):
+              summary = ex[summary_key].strip()
+              trace = ex[trace_key].strip()
+              prompt = (
+                  "You are reconstructing a full reasoning trace from a compressed summary.\n"
+                  f"Summary:\n{summary}\n\n"
+                  "Reconstructed full trace:\n"
+              )
+              return {"text": prompt + trace, "summary": summary, "trace": trace}
+
+          ds = ds.map(build_example)
+          train_ds = ds.select(range(min(TRAIN_SAMPLES, len(ds))))
+          eval_ds = ds.select(range(min(TRAIN_SAMPLES, len(ds)), min(TRAIN_SAMPLES + EVAL_SAMPLES, len(ds))))
+
+          def tokenize_batch(batch):
+              toks = tokenizer(
+                  batch["text"],
+                  truncation=True,
+                  max_length=MAX_LENGTH,
+                  padding="max_length",
+              )
+              toks["labels"] = toks["input_ids"].copy()
+              return toks
+
+          tokenized_train = train_ds.map(tokenize_batch, batched=True, remove_columns=train_ds.column_names)
+          tokenized_eval = eval_ds.map(tokenize_batch, batched=True, remove_columns=eval_ds.column_names)
+
+          args = TrainingArguments(
+              output_dir="trace-inversion-artifacts",
+              overwrite_output_dir=True,
+              per_device_train_batch_size=1,
+              per_device_eval_batch_size=1,
+              gradient_accumulation_steps=8,
+              learning_rate=2e-5,
+              num_train_epochs=1,
+              max_steps=MAX_STEPS,
+              logging_steps=5,
+              eval_steps=10,
+              evaluation_strategy="steps",
+              save_strategy="no",
+              report_to=[],
+              fp16=False,
+              bf16=False,
+              dataloader_num_workers=2,
+              remove_unused_columns=False,
+          )
+
+          trainer = Trainer(
+              model=model,
+              args=args,
+              train_dataset=tokenized_train,
+              eval_dataset=tokenized_eval,
+              tokenizer=tokenizer,
+          )
+
+          print("Starting capped run...")
+          trainer.train()
+
+          print("Evaluating inversion quality via token-overlap F1 on eval subset...")
+          sample_eval = eval_ds.select(range(min(16, len(eval_ds))))
+          f1_scores = []
+          for ex in sample_eval:
+              prompt = (
+                  "You are reconstructing a full reasoning trace from a compressed summary.\n"
+                  f"Summary:\n{ex['summary']}\n\n"
+                  "Reconstructed full trace:\n"
+              )
+              inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH)
+              with torch.no_grad():
+                  generated = model.generate(
+                      **inputs,
+                      max_new_tokens=128,
+                      do_sample=False,
+                      temperature=1.0,
+                      pad_token_id=tokenizer.pad_token_id,
+                  )
+              pred = tokenizer.decode(generated[0], skip_special_tokens=True)
+              f1_scores.append(token_overlap_f1(pred, ex["trace"]))
+
+          mean_f1 = sum(f1_scores) / max(1, len(f1_scores))
+          print(f"token_overlap_f1_mean={mean_f1:.4f}")
+          print("Trace inversion smoke test complete.")
+          PY

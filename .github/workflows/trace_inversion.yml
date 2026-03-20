@@ -34,16 +34,16 @@ jobs:
             "datasets>=2.20" \
             "accelerate>=0.34" \
             "scikit-learn>=1.5" \
-            distillkit \
             bitsandbytes
+          # distillkit is not consistently published on PyPI; fall back to the official GitHub source.
+          pip install --no-cache-dir distillkit || \
+          pip install --no-cache-dir "git+https://github.com/arcee-ai/DistillKit.git"
 
       - name: Run summary-to-trace inversion smoke experiment (50 steps)
         run: |
           python - <<'PY'
-          import os
           import random
           import re
-          from dataclasses import dataclass
 
           import torch
           from datasets import load_dataset
